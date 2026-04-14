@@ -1,13 +1,16 @@
 """Transcribe YouTube videos and format into structured markdown.
 
 Two-phase process:
-1. Raw transcription via configurable provider (OpenRouter, etc.)
-2. Formatting into markdown with headings via LLM
+1. Raw transcription via ClipScript API (polls until transcript is ready)
+2. Formatting into structured markdown with headings via LLM
+
+Optional: Quran verse validation (requires `quran-validator` package).
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,7 +22,12 @@ from ..config import PipelineConfig
 from ..storage import JSONLStore, ProgressTracker
 
 
+CLIPSCRIPT_API = "https://clipscript.uk"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
+
+# Polling configuration for ClipScript
+POLL_INTERVAL = 5  # seconds
+MAX_POLL_ATTEMPTS = 60  # 5min max wait (yt-dlp download + transcription)
 
 FORMAT_SYSTEM_PROMPT = """You are a professional transcription editor.
 
@@ -35,6 +43,88 @@ CONTINUATION RULES:
 - If the response would be too long, add "[continue]" at the end
 - When continuing, start exactly where you left off — do not repeat content
 """
+
+# Quran validation support (optional)
+_quran_validator = None
+_quran_system_prompt = ""
+
+
+def _init_quran_validation():
+    """Try to load quran-validator for optional Quran verse correction."""
+    global _quran_validator, _quran_system_prompt
+    if _quran_validator is not None:
+        return True
+    try:
+        from quran_validator import QuranValidator, normalize_arabic, SYSTEM_PROMPTS
+        _quran_validator = QuranValidator()
+        _quran_system_prompt = SYSTEM_PROMPTS.get("xml", "")
+        return True
+    except ImportError:
+        return False
+
+
+def _fix_tagged_verses(text: str) -> str:
+    """Replace LLM-tagged <quran ref="S:A">...</quran> with authentic Uthmani text.
+
+    Requires the `quran-validator` package. If not installed, strips tags only.
+    """
+    if not _init_quran_validation():
+        return re.sub(r"</?quran[^>]*>", "", text)
+
+    from quran_validator import normalize_arabic
+
+    pattern = re.compile(r'<quran\s+ref="(\d+):(\d+)(?:-(\d+))?"\s*>(.*?)</quran>', re.DOTALL)
+
+    def _align_partial(quote: str, full_verse: str) -> str | None:
+        n_quote = normalize_arabic(quote).split()
+        full_words = full_verse.split()
+        n_full = [normalize_arabic(w) for w in full_words]
+        if not n_quote or len(n_quote) > len(n_full):
+            return None
+        for i in range(len(n_full) - len(n_quote) + 1):
+            if all(n_full[i + j] == n_quote[j] for j in range(len(n_quote))):
+                return " ".join(full_words[i:i + len(n_quote)])
+        return None
+
+    def _preserve_brackets(original: str, corrected: str) -> str:
+        has_open = original.startswith("﴿")
+        has_close = original.endswith("﴾")
+        result = re.sub(r"^﴿\s*", "", corrected)
+        result = re.sub(r"\s*﴾$", "", result)
+        if has_open:
+            result = f"﴿{result}"
+        if has_close:
+            result = f"{result}﴾"
+        return result
+
+    def replace_match(m):
+        surah = int(m.group(1))
+        start_ayah = int(m.group(2))
+        end_ayah = int(m.group(3)) if m.group(3) else None
+        original_text = m.group(4).strip()
+
+        if end_ayah:
+            parts = []
+            for ayah in range(start_ayah, end_ayah + 1):
+                verse = _quran_validator.get_verse(surah, ayah)
+                if verse:
+                    parts.append(verse.text)
+            if parts:
+                return " ۝ ".join(parts)
+        else:
+            verse = _quran_validator.get_verse(surah, start_ayah)
+            if verse:
+                aligned = _align_partial(original_text, verse.text)
+                if aligned:
+                    return _preserve_brackets(original_text, aligned)
+                if len(original_text) / max(len(verse.text), 1) > 0.4:
+                    return _preserve_brackets(original_text, verse.text)
+
+        return original_text
+
+    result = pattern.sub(replace_match, text)
+    result = re.sub(r"</?quran[^>]*>", "", result)
+    return result
 
 
 def _call_openrouter(messages: list[dict], model: str, api_key: str, max_tokens: int = 16000) -> str:
@@ -78,10 +168,19 @@ def _clean_formatted_content(text: str) -> str:
     return content
 
 
-def format_transcript(raw_transcript: str, video_title: str, model: str, api_key: str) -> str:
+def _get_format_system_prompt(config: PipelineConfig) -> str:
+    """Build the formatting system prompt, optionally including Quran tagging instructions."""
+    prompt = FORMAT_SYSTEM_PROMPT
+    if config.transcription.quran_validation and _init_quran_validation():
+        prompt += "\n\n" + _quran_system_prompt
+    return prompt
+
+
+def format_transcript(raw_transcript: str, video_title: str, model: str, api_key: str, config: PipelineConfig) -> str:
     """Format raw transcript to structured markdown via LLM with continuation support."""
+    system_prompt = _get_format_system_prompt(config)
     messages = [
-        {"role": "system", "content": FORMAT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"Video title: {video_title}\n\nRaw transcript:\n{raw_transcript}"},
     ]
 
@@ -102,21 +201,58 @@ def format_transcript(raw_transcript: str, video_title: str, model: str, api_key
         else:
             break
 
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+
+    # Validate and fix Quran verses if enabled
+    if config.transcription.quran_validation:
+        try:
+            result = _fix_tagged_verses(result)
+        except Exception:
+            result = re.sub(r"</?quran[^>]*>", "", result)
+
+    return result
 
 
-def _transcribe_with_retry(youtube_id: str, model: str, api_key: str, max_retries: int = 3) -> str:
-    """Transcribe a video with exponential backoff."""
-    # Use OpenRouter with a transcription-capable model
-    messages = [
-        {"role": "system", "content": "Transcribe the following YouTube video accurately. Return only the transcript text."},
-        {"role": "user", "content": f"Please transcribe this YouTube video: https://www.youtube.com/watch?v={youtube_id}"},
-    ]
+# -------------------- CLIPSCRIPT TRANSCRIPTION --------------------
+def _transcribe_via_clipscript(youtube_id: str, api_key: str, language: str = "en") -> str:
+    """Call ClipScript API and poll until transcript is ready."""
+    youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
 
+    for attempt in range(MAX_POLL_ATTEMPTS):
+        response = requests.post(
+            CLIPSCRIPT_API,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "url": youtube_url,
+                "language": language,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        if "error" in result:
+            raise ValueError(result["error"])
+        if "transcript" in result:
+            return result["transcript"]
+        if result.get("status") == "pending":
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        raise ValueError(f"Unexpected response: {result}")
+
+    raise TimeoutError(f"Transcript not ready after {MAX_POLL_ATTEMPTS * POLL_INTERVAL}s")
+
+
+def _transcribe_with_retry(youtube_id: str, api_key: str, language: str = "en", max_retries: int = 3) -> str:
+    """Transcribe via ClipScript with exponential backoff."""
     last_error = None
     for attempt in range(max_retries):
         try:
-            return _call_openrouter(messages, model, api_key)
+            return _transcribe_via_clipscript(youtube_id, api_key, language)
         except requests.exceptions.HTTPError as e:
             last_error = e
             if e.response.status_code == 429:
@@ -125,6 +261,9 @@ def _transcribe_with_retry(youtube_id: str, model: str, api_key: str, max_retrie
                 time.sleep((2 ** attempt) * 5)
             else:
                 raise
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            time.sleep((2 ** attempt) * 5)
         except requests.exceptions.RequestException as e:
             last_error = e
             time.sleep((2 ** attempt) * 3)
@@ -133,7 +272,7 @@ def _transcribe_with_retry(youtube_id: str, model: str, api_key: str, max_retrie
 
 
 def _process_video(video: dict, config: PipelineConfig, store: JSONLStore, progress: ProgressTracker) -> dict:
-    """Process a single video: transcribe and format."""
+    """Process a single video: transcribe via ClipScript and format via LLM."""
     video_id = video["id"]
     youtube_id = video.get("youtube_id", "")
     title = video.get("title") or video.get("full_title") or f"Video {video_id}"
@@ -142,16 +281,20 @@ def _process_video(video: dict, config: PipelineConfig, store: JSONLStore, progr
         return {"skipped": True}
 
     clean_yt_id = youtube_id.split("?")[0]
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
+    clipscript_key = os.getenv("CLIPSCRIPT_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+
+    if not clipscript_key:
+        return {"error": "CLIPSCRIPT_API_KEY not set"}
+    if not openrouter_key:
         return {"error": "OPENROUTER_API_KEY not set"}
 
     result = {"video_id": video_id, "youtube_id": clean_yt_id}
 
-    # Step 1: Raw transcript
+    # Step 1: Raw transcript via ClipScript
     if not store.has_transcript(video_id, formatted=False):
         try:
-            raw = _transcribe_with_retry(clean_yt_id, config.transcription.model, api_key)
+            raw = _transcribe_with_retry(clean_yt_id, clipscript_key, config.channel.source_language)
             store.write_transcript(video_id, raw, formatted=False)
             result["transcribed"] = True
             time.sleep(config.sleep)
@@ -159,11 +302,11 @@ def _process_video(video: dict, config: PipelineConfig, store: JSONLStore, progr
             result["error"] = str(e)
             return result
 
-    # Step 2: Format
+    # Step 2: Format via LLM
     if not store.has_transcript(video_id, formatted=True):
         try:
             raw = store.read_transcript(video_id, formatted=False)
-            formatted = format_transcript(raw, title, config.transcription.format_model, api_key)
+            formatted = format_transcript(raw, title, config.transcription.format_model, openrouter_key, config)
             store.write_transcript(video_id, formatted, formatted=True)
             result["formatted"] = True
             time.sleep(config.sleep)
@@ -182,6 +325,13 @@ def run(config: PipelineConfig) -> dict:
 
     store = JSONLStore(config.data_dir)
     progress = ProgressTracker(config.data_dir, "transcribe")
+
+    # Check for Quran validation
+    if config.transcription.quran_validation:
+        if _init_quran_validation():
+            print("  Quran validation: enabled")
+        else:
+            print("  Quran validation: quran-validator not installed, skipping")
 
     # Collect videos needing transcription
     videos = [v for v in store.stream("videos") if v.get("youtube_id") and not progress.is_done(v["id"])]

@@ -11,10 +11,9 @@ content_types:
   - videos                    # Content types to process
 
 transcription:
-  provider: openrouter
-  model: google/gemini-2.5-flash
-  format_model: google/gemini-2.5-flash
+  format_model: google/gemini-2.5-flash   # LLM for structuring raw transcripts into markdown
   parallel_workers: 6
+  quran_validation: false                  # Set true for Islamic content (requires quran-validator)
 
 translation:
   locales:                    # Target languages (source language is excluded automatically)

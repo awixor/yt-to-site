@@ -5,7 +5,7 @@ Turn any YouTube channel into a multi-language content website.
 Point it at a channel handle, configure your target languages, and get a full pipeline that:
 
 1. **Syncs** video metadata from YouTube
-2. **Transcribes** videos into structured markdown
+2. **Transcribes** videos via [ClipScript](https://clipscript.uk) and formats into structured markdown
 3. **Summarizes** content for SEO and interlinking
 4. **Translates** to multiple languages
 5. **Interlinks** content with semantic hyperlinks
@@ -57,7 +57,8 @@ Add to `.env`:
 | Key | Used For | Required |
 |-----|----------|----------|
 | `YOUTUBE_API_KEY` | Fetching channel videos | Yes |
-| `OPENROUTER_API_KEY` | Transcription, translation, summarization, SEO | Yes |
+| `CLIPSCRIPT_API_KEY` | Video transcription via [ClipScript](https://clipscript.uk) | Yes |
+| `OPENROUTER_API_KEY` | Transcript formatting, translation, summarization, SEO | Yes |
 | `COHERE_API_KEY` | Semantic embeddings for interlinking | For interlink stage |
 
 ## Web Frontend
@@ -75,7 +76,7 @@ The Next.js app reads directly from the `data/` directory (JSONL files + transcr
 ```
 YouTube API → youtube_sync → data/videos.jsonl
                                 ↓
-             transcribe    → data/transcripts/*.md
+  ClipScript → transcribe  → data/transcripts/*.md
                                 ↓
              summarize     → summary field in JSONL
                                 ↓
@@ -95,7 +96,7 @@ Each stage is **resumable** — it tracks processed IDs and skips already-done i
 | Stage | What it does |
 |-------|-------------|
 | `youtube_sync` | Fetches video metadata from YouTube Data API |
-| `transcribe` | Transcribes videos and formats into markdown (parallel) |
+| `transcribe` | Transcribes videos via ClipScript, formats into markdown (parallel) |
 | `summarize` | Generates one-sentence summaries for SEO anchoring |
 | `translate` | Translates content + transcripts to target locales |
 | `interlink` | Embeds content, finds related items, inserts markdown links |
@@ -119,6 +120,23 @@ data/
 ├── seo-meta.json             # SEO metadata
 └── *_progress.json           # Resumption tracking
 ```
+
+## Quran Validation (Optional)
+
+For Islamic content channels, the transcription stage can validate and correct Quran verses using authentic Uthmani text. Enable it in your config:
+
+```yaml
+transcription:
+  quran_validation: true
+```
+
+This requires the [`quran-validator`](https://pypi.org/project/quran-validator/) package:
+
+```bash
+pip install quran-validator
+```
+
+When enabled, the LLM tags Quran verses during formatting, and the pipeline replaces them with verified text from the bundled Quran database.
 
 ## License
 

@@ -19,12 +19,11 @@ class ChannelConfig(BaseModel):
 class TranscriptionConfig(BaseModel):
     """Transcription stage configuration."""
 
-    provider: str = "openrouter"  # openrouter, local
-    model: str = "google/gemini-2.5-flash"
     format_model: str = "google/gemini-2.5-flash"
     parallel_workers: int = 6
     poll_interval: int = 5
     max_poll_attempts: int = 60
+    quran_validation: bool = False  # enable Quran verse correction (requires quran-validator)
 
 
 class TranslationConfig(BaseModel):
