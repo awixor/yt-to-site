@@ -1,0 +1,50 @@
+# yt-to-site pipeline configuration
+# Copy this to config.yaml and customize for your channel.
+
+channel:
+  handle: "@mkbhd"           # YouTube channel handle
+  source_language: en         # Primary language of the channel
+
+data_dir: data                # Where JSONL files and transcripts are stored
+
+content_types:
+  - videos                    # Content types to process
+
+transcription:
+  provider: openrouter
+  model: google/gemini-2.5-flash
+  format_model: google/gemini-2.5-flash
+  parallel_workers: 6
+
+translation:
+  locales:                    # Target languages (source language is excluded automatically)
+    - es
+    - fr
+  model: google/gemini-2.5-flash
+  fallback_model: google/gemini-2.5-pro
+  batch_size: 20
+  parallel_workers: 5
+
+summarization:
+  model: google/gemini-2.5-flash
+
+interlink:
+  embed_model: embed-multilingual-v3.0
+  embed_batch_size: 96
+  min_similarity: 0.3
+  max_links_per_chunk: 3
+
+seo:
+  model: google/gemini-2.5-flash
+
+web:
+  site_name: "MKBHD Archive"
+  site_description: "Every MKBHD video, transcribed, translated, and interlinked"
+  default_locale: en
+  supported_locales:
+    - en
+    - es
+    - fr
+  domain: mkbhd-archive.example.com
+
+sleep: 1.0                    # Delay between API calls (seconds)
