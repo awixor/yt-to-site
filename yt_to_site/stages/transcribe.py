@@ -22,12 +22,12 @@ from ..config import PipelineConfig
 from ..storage import JSONLStore, ProgressTracker
 
 
-CLIPSCRIPT_API = "https://clipscript.uk"
+CLIPSCRIPT_API = "https://clipscript.uk/api/v1/transcriptions"
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 
 # Polling configuration for ClipScript
-POLL_INTERVAL = 5  # seconds
-MAX_POLL_ATTEMPTS = 60  # 5min max wait (yt-dlp download + transcription)
+POLL_INTERVAL = 10  # seconds
+MAX_POLL_ATTEMPTS = 120  # 20min max wait (yt-dlp download + transcription can be slow)
 
 FORMAT_SYSTEM_PROMPT = """You are a professional transcription editor.
 
@@ -218,16 +218,41 @@ def _transcribe_via_clipscript(youtube_id: str, api_key: str, language: str = "e
     """Call ClipScript API and poll until transcript is ready."""
     youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
 
+    # 1. Start transcription job (POST)
+    response = requests.post(
+        CLIPSCRIPT_API,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "url": youtube_url,
+            "language": language,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    result = response.json()
+
+    if "error" in result:
+        raise ValueError(result["error"])
+
+    # If it's already complete (cached), return immediately
+    if result.get("status") == "complete":
+        return result["transcript"]
+
+    job_id = result.get("id")
+    if not job_id:
+        raise ValueError(f"Unexpected response (no job ID): {result}")
+
+    # 2. Poll until complete (GET)
     for attempt in range(MAX_POLL_ATTEMPTS):
-        response = requests.post(
-            CLIPSCRIPT_API,
+        time.sleep(POLL_INTERVAL)
+        
+        response = requests.get(
+            f"{CLIPSCRIPT_API}/{job_id}",
             headers={
                 "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "url": youtube_url,
-                "language": language,
             },
             timeout=30,
         )
@@ -236,13 +261,10 @@ def _transcribe_via_clipscript(youtube_id: str, api_key: str, language: str = "e
 
         if "error" in result:
             raise ValueError(result["error"])
-        if "transcript" in result:
+        if result.get("status") == "complete":
             return result["transcript"]
-        if result.get("status") == "pending":
-            time.sleep(POLL_INTERVAL)
-            continue
-
-        raise ValueError(f"Unexpected response: {result}")
+        if result.get("status") == "failed":
+            raise ValueError(f"Transcription failed for job {job_id}")
 
     raise TimeoutError(f"Transcript not ready after {MAX_POLL_ATTEMPTS * POLL_INTERVAL}s")
 

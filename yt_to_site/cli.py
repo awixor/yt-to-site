@@ -15,7 +15,8 @@ from .pipeline import run_pipeline
 @click.version_option()
 def main():
     """yt-to-site: Turn any YouTube channel into a multi-language content website."""
-    pass
+    from dotenv import load_dotenv
+    load_dotenv()
 
 
 @main.command()
